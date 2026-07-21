@@ -8,7 +8,7 @@
     "test": "npm run build && tsx --test test/*.test.ts"
   },
   "dependencies": {
-    "@adversarylabs/sdk": "^0.1.4",
+    "@adversarylabs/sdk": "^0.1.7",
     "@typescript-eslint/parser": "^8.65.0",
     "eslint": "^10.7.0",
     "eslint-plugin-sonarjs": "^4.2.0",

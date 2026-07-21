@@ -75,3 +75,7 @@ npm test
 ```
 
 The release artifact is a self-contained ESM bundle and does not require `node_modules` at execution time.
+
+## Automatic detection
+
+`adversary auto` selects the Complexity adversary when supported JavaScript or TypeScript source files change.
