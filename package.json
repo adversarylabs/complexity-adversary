@@ -1,0 +1,24 @@
+{
+  "name": "complexity",
+  "version": "0.0.1",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json --noEmit && node scripts/build.mjs",
+    "test": "npm run build && tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@adversarylabs/sdk": "^0.1.4",
+    "@typescript-eslint/parser": "^8.65.0",
+    "eslint": "^10.7.0",
+    "eslint-plugin-sonarjs": "^4.2.0",
+    "jiti": "^2.7.0"
+  },
+  "devDependencies": {
+    "@types/eslint": "^9.6.1",
+    "@types/node": "^22.10.2",
+    "esbuild": "^0.28.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,34 @@
+name: complexity
+version: 0.0.1
+description: Reviews code changes for implementation complexity that appears disproportionate to the behavior being added.
+
+triggers:
+  manual: true
+  files_changed:
+    - "**/*.js"
+    - "**/*.jsx"
+    - "**/*.mjs"
+    - "**/*.cjs"
+    - "**/*.ts"
+    - "**/*.tsx"
+    - "**/*.mts"
+    - "**/*.cts"
+
+runtime:
+  name: node
+  version: "22"
+  command:
+    - dist/index.js
+
+permissions:
+  enforcement: advisory
+  filesystem:
+    read:
+      - .
+    write: []
+  network: false
+  environment:
+    allow: []
+
+findings:
+  format: adversary.review.v1

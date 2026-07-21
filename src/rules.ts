@@ -1,0 +1,549 @@
+import { type RuleContext } from "@adversarylabs/sdk";
+import { type Analysis, type FileMetrics, type FunctionDelta, type FunctionMetrics } from "./types.js";
+
+interface Candidate {
+  delta: FunctionDelta;
+  reason: string;
+}
+
+interface DesignSignals {
+  premature: Array<{ path: string; line: number; kind: string; name: string; detail: string }>;
+  wrapperGrowth: number;
+  chain?: { path: string; names: string[]; line: number };
+  complexityPressure: number;
+}
+
+export function reviewComplexity(ctx: RuleContext, analysis: Analysis): void {
+  const cyclomatic = analysis.mode === "diff" ? analysis.deltas.filter(isCyclomaticIncrease) : [];
+  const cognitive = analysis.mode === "diff" ? analysis.deltas.filter(isCognitiveIncrease) : [];
+  const nesting = analysis.deltas.filter((delta) => increased(delta, "nesting", 2, 4, 5));
+  const growth = analysis.deltas.filter(isLargeGrowth);
+  const parameters = analysis.deltas.filter((delta) => increased(delta, "parameters", 3, 7, 8));
+  const responsibilities = analysis.deltas.filter(isResponsibilityExpansion);
+  const hiddenState = analysis.deltas.filter((delta) => increased(delta, "hiddenState", 2, 4, 5));
+  const magicConditions = analysis.deltas.filter((delta) => increased(delta, "booleanTerms", 2, 5, 6));
+  const configuration = analysis.deltas.filter((delta) => increased(delta, "configSurface", 4, 8, 10));
+  const recursion = analysis.deltas.filter(isRecursionRisk);
+  const errors = analysis.deltas.filter((delta) => increased(delta, "errorPaths", 2, 4, 5));
+  const design = designSignals(analysis, cyclomatic.length + cognitive.length + nesting.length);
+  const branchWithoutTests =
+    analysis.mode === "diff" &&
+    analysis.aggregateBranchDelta >= 6 &&
+    analysis.changedSourceFiles > 0 &&
+    analysis.changedTestFiles === 0;
+  const aiOverengineering = overengineeringScore(analysis, design, growth, responsibilities) >= 6;
+
+  emitMetricFinding(ctx, {
+    ruleId: "complexity.cyclomatic.increase",
+    title: "Control-flow complexity increased substantially",
+    category: "maintainability",
+    candidates: cyclomatic.map((delta) => ({ delta, reason: metricSentence(delta, "cyclomatic", "Cyclomatic") })),
+    why: "A large control-flow delta makes a change harder to verify and maintain even when the final absolute value is defensible.",
+    recommendation: "Check whether guard clauses, smaller cohesive functions, or a simpler decision model can preserve the behavior with fewer paths.",
+  });
+  emitMetricFinding(ctx, {
+    ruleId: "complexity.cognitive.increase",
+    title: "The change became materially harder to reason about",
+    category: "maintainability",
+    candidates: cognitive.map((delta) => ({ delta, reason: metricSentence(delta, "cognitive", "Cognitive") })),
+    why: "Cognitive complexity reflects the nesting and interruptions a reader must retain while following the implementation.",
+    recommendation: "Flatten the main path and extract decisions that can be named independently of the orchestration.",
+  });
+  emitMetricFinding(ctx, {
+    ruleId: "complexity.nesting.depth",
+    title: "Changed control flow is nested too deeply",
+    category: "maintainability",
+    candidates: nesting.map((delta) => ({ delta, reason: metricSentence(delta, "nesting", "Nesting depth") })),
+    why: "Deep nesting forces readers to track several active conditions and error states simultaneously.",
+    recommendation: "Prefer guard clauses and early returns, then extract a cohesive inner operation if the nesting still remains.",
+  });
+  emitMetricFinding(ctx, {
+    ruleId: "complexity.large-function-growth",
+    title: "Functions grew faster than their behavior appears to require",
+    category: "maintainability",
+    candidates: growth.map((delta) => ({ delta, reason: `${metricSentence(delta, "loc", "LOC")} Branches: ${before(delta, "branches")} → ${delta.current.branches}.` })),
+    why: "Rapid function growth often signals that orchestration, policy, and mechanics are being combined in one place.",
+    recommendation: "Keep the high-level flow visible and move cohesive policy or mechanics behind names that explain their purpose.",
+  });
+  emitMetricFinding(ctx, {
+    ruleId: "complexity.parameter-growth",
+    title: "Parameter lists expanded materially",
+    category: "design",
+    candidates: parameters.map((delta) => ({ delta, reason: metricSentence(delta, "parameters", "Parameters") })),
+    why: "A growing positional parameter list can expose missing domain boundaries and makes call sites easier to misuse.",
+    recommendation: "If these values travel together, consider a focused domain input object; do not introduce one solely to hide the count.",
+    confidence: "medium",
+  });
+
+  if (aiOverengineering) {
+    emitOverengineering(ctx, analysis, design, growth, responsibilities);
+  } else {
+    emitPrematureAbstraction(ctx, design);
+    emitIndirection(ctx, design);
+  }
+
+  if (branchWithoutTests) {
+    const evidence = analysis.deltas
+      .filter((delta) => delta.current.branches > (delta.previous?.branches ?? 0))
+      .sort((a, b) => branchDelta(b) - branchDelta(a))
+      .slice(0, 4)
+      .map((delta) => functionEvidence(delta, `Decision points increased by ${branchDelta(delta)} without a changed test file.`));
+    ctx.finding({
+      ruleId: "complexity.branch-without-tests",
+      title: "Control-flow growth is not accompanied by test changes",
+      category: "testing",
+      severity: "medium",
+      confidence: "high",
+      summary: `Changed functions added ${analysis.aggregateBranchDelta} structural decision points, but this change does not modify tests.`,
+      whyItMatters: "New paths are where boundary conditions and regressions concentrate; unchanged tests provide little evidence that those paths were considered.",
+      impact: "Reviewers must reason about the additional branches manually, and future refactors can break an unexercised path silently.",
+      evidence,
+      recommendation: "Add focused tests for the new decisions and error paths, especially combinations that are not covered by the happy path.",
+      remediation: { complexity: "medium" },
+    });
+  }
+
+  emitMetricFinding(ctx, {
+    ruleId: "complexity.responsibility-expansion",
+    title: "Functions accumulated multiple engineering responsibilities",
+    category: "design",
+    candidates: responsibilities.map((delta) => ({
+      delta,
+      reason: `Responsibilities: ${list(delta.previous?.responsibilities ?? []) || "none"} → ${list(delta.current.responsibilities)}.`,
+    })),
+    why: "Combining parsing, validation, orchestration, persistence, and presentation makes changes harder to isolate and test.",
+    recommendation: "Separate only the responsibilities that change independently, keeping the orchestration readable rather than creating layers mechanically.",
+    confidence: "medium",
+  });
+  emitMetricFinding(ctx, {
+    ruleId: "complexity.hidden-state",
+    title: "Changed code relies on more hidden mutable state",
+    category: "design",
+    candidates: hiddenState.map((delta) => ({ delta, reason: metricSentence(delta, "hiddenState", "Hidden-state writes") })),
+    why: "Mutable module, instance, or cache state creates behavior that is not visible in a function's inputs and outputs.",
+    recommendation: "Make state transitions explicit where practical and avoid behavior flags whose combinations create implicit modes.",
+    confidence: "medium",
+  });
+  emitMetricFinding(ctx, {
+    ruleId: "complexity.magic-conditions",
+    title: "Boolean policy became difficult to read inline",
+    category: "maintainability",
+    candidates: magicConditions.map((delta) => ({ delta, reason: metricSentence(delta, "booleanTerms", "Largest boolean expression") })),
+    why: "Long boolean expressions hide the policy being applied and make truth-table gaps easy to miss.",
+    recommendation: "Extract named predicates that describe the policy, and test their boundary combinations directly.",
+  });
+  emitMetricFinding(ctx, {
+    ruleId: "complexity.configuration-explosion",
+    title: "Configuration surface expanded rapidly",
+    category: "design",
+    candidates: configuration.map((delta) => ({ delta, reason: metricSentence(delta, "configSurface", "Configuration fields read") })),
+    why: "A rapidly growing set of optional controls creates implicit modes and a feature matrix that becomes difficult to validate.",
+    recommendation: "Group configuration by cohesive behavior and remove combinations that are not intentionally supported.",
+    confidence: "medium",
+  });
+  emitMetricFinding(ctx, {
+    ruleId: "complexity.recursion-risk",
+    title: "Recursive control flow became harder to reason about",
+    category: "correctness",
+    candidates: recursion.map((delta) => ({ delta, reason: metricSentence(delta, "recursiveCalls", "Recursive paths") })),
+    why: "Multiple recursive paths make termination, repeated work, and partial failure harder to establish locally.",
+    recommendation: "Make the termination invariant explicit and consider an iterative worklist when several recursive branches share state.",
+    confidence: "medium",
+  });
+  emitMetricFinding(ctx, {
+    ruleId: "complexity.error-paths",
+    title: "Error handling expanded into competing control paths",
+    category: "reliability",
+    candidates: errors.map((delta) => ({ delta, reason: metricSentence(delta, "errorPaths", "Error paths") })),
+    why: "Nested catches, repeated cleanup, and cascading error conditions obscure which failures are handled, transformed, or allowed to escape.",
+    recommendation: "Keep cleanup in one structured boundary and flatten error translation so each failure has one obvious path.",
+  });
+
+  addPositiveSignals(ctx, analysis);
+  addOverallReview(ctx, analysis, {
+    materialFindings: cyclomatic.length + cognitive.length + nesting.length + growth.length + responsibilities.length + (aiOverengineering ? 2 : 0),
+    aiOverengineering,
+  });
+}
+
+function emitMetricFinding(
+  ctx: RuleContext,
+  input: {
+    ruleId: string;
+    title: string;
+    category: string;
+    candidates: Candidate[];
+    why: string;
+    recommendation: string;
+    confidence?: "medium" | "high";
+  },
+): void {
+  if (input.candidates.length === 0) return;
+  const candidates = input.candidates
+    .sort((a, b) => importance(b.delta) - importance(a.delta))
+    .slice(0, 5);
+  ctx.finding({
+    ruleId: input.ruleId,
+    title: input.title,
+    category: input.category,
+    severity: "medium",
+    confidence: input.confidence ?? "high",
+    summary:
+      candidates.length === 1
+        ? `${candidates[0]?.delta.current.name} shows a disproportionate increase in this change.`
+        : `${candidates.length} changed functions show related complexity growth; the largest deltas are grouped here.`,
+    whyItMatters: input.why,
+    impact: "The implementation takes longer to review, is easier to change incorrectly, and makes the underlying behavior less visible.",
+    evidence: candidates.map((candidate) => functionEvidence(candidate.delta, candidate.reason)),
+    recommendation: input.recommendation,
+    remediation: { complexity: "medium" },
+  });
+}
+
+function emitPrematureAbstraction(ctx: RuleContext, design: DesignSignals): void {
+  if (design.premature.length < 2) return;
+  ctx.finding({
+    ruleId: "complexity.abstraction.premature",
+    title: "New abstractions have little demonstrated variation",
+    category: "design",
+    severity: "low",
+    confidence: "medium",
+    summary: "The change introduces abstraction points that currently have one implementation, one constructed type, or one use.",
+    whyItMatters: "An abstraction that does not yet separate real variation adds concepts and navigation cost without reducing change coupling.",
+    impact: "Future maintainers must understand both the abstraction and implementation even though the code currently has only one behavior.",
+    evidence: design.premature.slice(0, 5).map((signal) => ({
+      location: { file: signal.path, line: signal.line },
+      message: `${signal.kind} ${signal.name}: ${signal.detail}`,
+      data: { kind: signal.kind, name: signal.name, detail: signal.detail },
+    })),
+    recommendation: "Keep abstractions that isolate a real boundary or likely near-term variation; otherwise use the concrete concept until a second use clarifies the interface.",
+    remediation: { complexity: "small" },
+  });
+}
+
+function emitIndirection(ctx: RuleContext, design: DesignSignals): void {
+  if (design.chain === undefined) return;
+  ctx.finding({
+    ruleId: "complexity.indirection",
+    title: "A simple operation crosses too many forwarding layers",
+    category: "design",
+    severity: "medium",
+    confidence: "medium",
+    summary: `The changed call path passes through ${design.chain.names.length} mostly forwarding functions.`,
+    whyItMatters: "Indirection is useful when a layer owns policy or substitution; forwarding-only layers make behavior harder to locate without adding a boundary.",
+    impact: "Understanding or debugging one operation requires navigating several files or functions that do not make an independent decision.",
+    evidence: [{
+      location: { file: design.chain.path, line: design.chain.line },
+      message: design.chain.names.join(" → "),
+      data: { depth: design.chain.names.length, chain: design.chain.names },
+    }],
+    recommendation: "Collapse forwarding-only layers while preserving layers that own policy, lifecycle, or a genuine substitution boundary.",
+    remediation: { complexity: "medium" },
+  });
+}
+
+function emitOverengineering(
+  ctx: RuleContext,
+  analysis: Analysis,
+  design: DesignSignals,
+  growth: FunctionDelta[],
+  responsibilities: FunctionDelta[],
+): void {
+  const evidence = [
+    ...design.premature.slice(0, 2).map((signal) => ({
+      location: { file: signal.path, line: signal.line },
+      message: `${signal.kind} ${signal.name}: ${signal.detail}`,
+      data: { signal: "low-variation-abstraction", detail: signal.detail },
+    })),
+    ...(design.chain === undefined ? [] : [{
+      location: { file: design.chain.path, line: design.chain.line },
+      message: `Forwarding chain: ${design.chain.names.join(" → ")}`,
+      data: { signal: "indirection", depth: design.chain.names.length },
+    }]),
+    ...growth.slice(0, 1).map((delta) => functionEvidence(delta, `${metricSentence(delta, "loc", "LOC")} Branches: ${before(delta, "branches")} → ${delta.current.branches}.`)),
+    ...responsibilities.slice(0, 1).map((delta) => functionEvidence(delta, `Now combines ${list(delta.current.responsibilities)}.`)),
+  ].slice(0, 5);
+  ctx.finding({
+    ruleId: "complexity.ai-overengineering",
+    title: "The implementation appears more architectural than the behavior requires",
+    category: "design",
+    severity: "medium",
+    confidence: "medium",
+    summary: "The change combines several AI-overengineering signals: low-variation abstractions, forwarding layers, and concentrated control-flow growth.",
+    whyItMatters: "Fighting a modest problem with additional architecture moves complexity rather than removing it, leaving more concepts, paths, and extension points to maintain.",
+    impact: "The code becomes noticeably harder to understand and modify even though the visible behavior and test surface have not expanded proportionally.",
+    evidence,
+    recommendation: "Start from the direct implementation, retain only boundaries that own real policy or variation, and make the primary behavior readable from one place.",
+    remediation: { complexity: "architectural" },
+    metadata: {
+      changedSourceFiles: analysis.changedSourceFiles,
+      changedTestFiles: analysis.changedTestFiles,
+      wrapperGrowth: design.wrapperGrowth,
+    },
+  });
+}
+
+function designSignals(analysis: Analysis, complexityPressure: number): DesignSignals {
+  const previousByPath = new Map(analysis.previous.map((file) => [file.path, file]));
+  const premature: DesignSignals["premature"] = [];
+  let wrapperGrowth = 0;
+  let bestChain: DesignSignals["chain"];
+
+  for (const file of analysis.current) {
+    const revision = analysis.files.find((item) => item.path === file.path);
+    const old = previousByPath.get(file.path);
+    const oldInterfaces = new Set(old?.abstractions.interfaces.map((item) => item.name) ?? []);
+    const oldFactories = new Set(old?.abstractions.factories.map((item) => item.name) ?? []);
+    const oldGenerics = new Set(old?.abstractions.genericDeclarations.map((item) => item.name) ?? []);
+    const changed = (line: number) => revision?.status !== "modified" || revision.changedLines.has(line);
+
+    for (const item of file.abstractions.interfaces) {
+      if (!oldInterfaces.has(item.name) && changed(item.line) && item.implementations <= 1) {
+        premature.push({ path: file.path, line: item.line, kind: "Interface", name: item.name, detail: `${item.implementations} concrete implementation${item.implementations === 1 ? "" : "s"}` });
+      }
+    }
+    for (const item of file.abstractions.factories) {
+      if (!oldFactories.has(item.name) && changed(item.line) && item.constructedTypes.length === 1) {
+        premature.push({ path: file.path, line: item.line, kind: "Factory", name: item.name, detail: `constructs only ${item.constructedTypes[0]}` });
+      }
+    }
+    for (const item of file.abstractions.genericDeclarations) {
+      if (!oldGenerics.has(item.name) && changed(item.line) && item.references <= 1) {
+        premature.push({ path: file.path, line: item.line, kind: "Generic", name: item.name, detail: `${item.parameters} type parameter${item.parameters === 1 ? "" : "s"}, ${item.references} external reference${item.references === 1 ? "" : "s"}` });
+      }
+    }
+
+    const oldWrappers = old?.abstractions.wrappers.length ?? 0;
+    wrapperGrowth += Math.max(0, file.abstractions.wrappers.length - oldWrappers);
+    const chain = longestWrapperChain(file);
+    if (chain !== undefined && chain.names.length >= 4 && (bestChain === undefined || chain.names.length > bestChain.names.length)) {
+      bestChain = chain;
+    }
+  }
+
+  return { premature, wrapperGrowth, chain: bestChain, complexityPressure };
+}
+
+function longestWrapperChain(file: FileMetrics): DesignSignals["chain"] {
+  const wrappers = new Map(file.abstractions.wrappers.map((item) => [item.name, item]));
+  let best: string[] = [];
+  let bestLine = 1;
+  for (const wrapper of wrappers.values()) {
+    const chain: string[] = [];
+    const seen = new Set<string>();
+    let current: typeof wrapper | undefined = wrapper;
+    while (current !== undefined && !seen.has(current.name)) {
+      chain.push(current.name);
+      seen.add(current.name);
+      const target: string | undefined = current.target?.split(".").pop();
+      current = target === undefined ? undefined : wrappers.get(target);
+    }
+    if (chain.length > best.length) {
+      best = chain;
+      bestLine = wrapper.line;
+    }
+  }
+  return best.length === 0 ? undefined : { path: file.path, names: best, line: bestLine };
+}
+
+function overengineeringScore(
+  analysis: Analysis,
+  design: DesignSignals,
+  growth: FunctionDelta[],
+  responsibilities: FunctionDelta[],
+): number {
+  let score = 0;
+  if (design.premature.length >= 2) score += 2;
+  if (design.wrapperGrowth >= 3) score += 2;
+  if (design.chain !== undefined) score += 2;
+  if (design.complexityPressure >= 2) score += 1;
+  if (growth.length > 0) score += 1;
+  if (responsibilities.length > 0) score += 1;
+  if (analysis.mode === "diff" && analysis.changedTestFiles === 0) score += 1;
+  return score;
+}
+
+function addPositiveSignals(ctx: RuleContext, analysis: Analysis): void {
+  if (analysis.mode !== "diff") return;
+  const reduced = analysis.deltas.filter((delta) =>
+    delta.previous !== undefined &&
+    delta.current.cyclomatic <= delta.previous.cyclomatic - 3 &&
+    delta.current.cognitive <= delta.previous.cognitive - 4,
+  );
+  if (reduced.length > 0) {
+    ctx.review.positive({
+      key: "complexity.reduced",
+      summary: `${reduced.length} changed function${reduced.length === 1 ? " is" : "s are"} materially easier to reason about.`,
+      evidence: reduced.slice(0, 3).map((delta) => functionEvidence(delta, `${metricSentence(delta, "cyclomatic", "Cyclomatic")} ${metricSentence(delta, "cognitive", "Cognitive")}`)),
+    });
+  }
+  const flattened = analysis.deltas.filter((delta) => delta.previous !== undefined && delta.current.nesting <= delta.previous.nesting - 2);
+  if (flattened.length > 0) {
+    ctx.review.positive({
+      key: "complexity.nesting.flattened",
+      summary: `Nesting was flattened in ${flattened.length} changed function${flattened.length === 1 ? "" : "s"}.`,
+      evidence: flattened.slice(0, 3).map((delta) => functionEvidence(delta, metricSentence(delta, "nesting", "Nesting depth"))),
+    });
+  }
+}
+
+function addOverallReview(
+  ctx: RuleContext,
+  analysis: Analysis,
+  result: { materialFindings: number; aiOverengineering: boolean },
+): void {
+  if (analysis.mode === "repository") {
+    ctx.review.assessment({
+      risk: result.materialFindings > 0 ? "medium" : "none",
+      summary: result.materialFindings > 0
+        ? "The repository contains concentrated complexity worth simplifying, but no historical baseline was available to judge whether it was introduced recently."
+        : "No disproportionate complexity was identified in the supported source files. No git delta was available, so this is a conservative repository-level assessment.",
+    });
+    ctx.review.opinion({
+      ship: result.materialFindings === 0,
+      summary: result.materialFindings > 0
+        ? "I would simplify the highlighted implementation before extending it further."
+        : "I would merge this as-is based on the available repository snapshot.",
+    });
+    return;
+  }
+
+  if (result.aiOverengineering || result.materialFindings >= 3) {
+    ctx.review.assessment({
+      risk: "medium",
+      summary: "The implementation became noticeably more difficult to reason about because new behavior is spread across additional control flow, responsibilities, or abstraction layers.",
+    });
+    ctx.review.opinion({
+      ship: false,
+      summary: "I would simplify the implementation before merging. The complexity increase appears larger than the demonstrated behavior and test expansion require.",
+    });
+  } else if (result.materialFindings > 0) {
+    ctx.review.assessment({
+      risk: "low",
+      summary: "The change adds localized complexity. Most of the implementation remains understandable, but the highlighted area deserves another simplification pass.",
+    });
+    ctx.review.opinion({
+      ship: true,
+      summary: "I would merge this after considering the focused simplification; the added complexity is not broadly architectural.",
+    });
+  } else {
+    const easier = analysis.deltas.some((delta) => delta.previous !== undefined && delta.current.cognitive < delta.previous.cognitive);
+    ctx.review.assessment({
+      risk: "none",
+      summary: easier
+        ? "The changed implementation became easier to follow overall, and no disproportionate complexity growth was identified."
+        : "The added complexity appears proportional to the changed behavior; no disproportionate growth was identified.",
+    });
+    ctx.review.opinion({ ship: true, summary: "I would merge this PR. The implementation remains proportionate to the behavior being added." });
+  }
+}
+
+function isCyclomaticIncrease(delta: FunctionDelta): boolean {
+  const previous = delta.previous?.cyclomatic ?? 0;
+  if (delta.previous === undefined) return delta.current.cyclomatic >= 12;
+  const increase = delta.current.cyclomatic - previous;
+  return delta.current.cyclomatic >= 8 && increase >= 5 && (increase >= 7 || delta.current.cyclomatic / Math.max(previous, 1) >= 1.4);
+}
+
+function isCognitiveIncrease(delta: FunctionDelta): boolean {
+  const previous = delta.previous?.cognitive ?? 0;
+  if (delta.previous === undefined) return delta.current.cognitive >= 18;
+  const increase = delta.current.cognitive - previous;
+  return delta.current.cognitive >= 12 && increase >= 8 && (increase >= 10 || delta.current.cognitive / Math.max(previous, 1) >= 1.5);
+}
+
+function isLargeGrowth(delta: FunctionDelta): boolean {
+  const previousLoc = delta.previous?.loc ?? 0;
+  const locDelta = delta.current.loc - previousLoc;
+  const branchIncrease = branchDelta(delta);
+  if (delta.previous === undefined) return delta.current.loc >= 100 && delta.current.branches >= 8;
+  return locDelta >= 40 && branchIncrease >= 3 && (locDelta >= 80 || delta.current.loc / Math.max(previousLoc, 1) >= 1.6);
+}
+
+function isResponsibilityExpansion(delta: FunctionDelta): boolean {
+  const previous = new Set(delta.previous?.responsibilities ?? []);
+  const additions = delta.current.responsibilities.filter((item) => !previous.has(item)).length;
+  if (delta.previous === undefined) return delta.current.responsibilities.length >= 5 && delta.current.loc >= 60;
+  return delta.current.responsibilities.length >= 4 && additions >= 2;
+}
+
+function isRecursionRisk(delta: FunctionDelta): boolean {
+  const previous = delta.previous?.recursiveCalls ?? 0;
+  if (delta.previous === undefined) return delta.current.recursiveCalls >= 2;
+  return delta.current.recursiveCalls >= 2 && delta.current.recursiveCalls > previous;
+}
+
+function increased(
+  delta: FunctionDelta,
+  key: NumericMetric,
+  minimumDelta: number,
+  minimumCurrent: number,
+  minimumAdded: number,
+): boolean {
+  const previous = delta.previous?.[key] ?? 0;
+  return delta.previous === undefined
+    ? delta.current[key] >= minimumAdded
+    : delta.current[key] >= minimumCurrent && delta.current[key] - previous >= minimumDelta;
+}
+
+type NumericMetric = {
+  [K in keyof FunctionMetrics]: FunctionMetrics[K] extends number ? K : never;
+}[keyof FunctionMetrics];
+
+function metricSentence(delta: FunctionDelta, key: NumericMetric, label: string): string {
+  const oldValue = delta.previous?.[key] ?? 0;
+  const current = delta.current[key];
+  return `${label}: ${oldValue} → ${current} (Δ +${current - oldValue}).`;
+}
+
+function before(delta: FunctionDelta, key: NumericMetric): number {
+  return delta.previous?.[key] ?? 0;
+}
+
+function branchDelta(delta: FunctionDelta): number {
+  return delta.current.branches - (delta.previous?.branches ?? 0);
+}
+
+function importance(delta: FunctionDelta): number {
+  return (
+    delta.current.cognitive - (delta.previous?.cognitive ?? 0) +
+    delta.current.cyclomatic - (delta.previous?.cyclomatic ?? 0) +
+    delta.current.nesting * 2
+  );
+}
+
+function functionEvidence(delta: FunctionDelta, message: string) {
+  return {
+    location: { file: delta.path, line: delta.current.line, endLine: delta.current.endLine },
+    label: delta.current.name,
+    message,
+    data: {
+      function: delta.current.name,
+      previous: metricSnapshot(delta.previous),
+      current: metricSnapshot(delta.current),
+      delta: {
+        cyclomatic: delta.current.cyclomatic - (delta.previous?.cyclomatic ?? 0),
+        cognitive: delta.current.cognitive - (delta.previous?.cognitive ?? 0),
+        nesting: delta.current.nesting - (delta.previous?.nesting ?? 0),
+        loc: delta.current.loc - (delta.previous?.loc ?? 0),
+        parameters: delta.current.parameters - (delta.previous?.parameters ?? 0),
+      },
+    },
+  };
+}
+
+function metricSnapshot(metrics?: FunctionMetrics): Record<string, unknown> | null {
+  if (metrics === undefined) return null;
+  return {
+    cyclomatic: metrics.cyclomatic,
+    cognitive: metrics.cognitive,
+    nesting: metrics.nesting,
+    loc: metrics.loc,
+    parameters: metrics.parameters,
+    branches: metrics.branches,
+  };
+}
+
+function list(items: string[]): string {
+  return items.join(", ");
+}
