@@ -9,8 +9,8 @@ import { reviewComplexity } from "./rules.js";
 
 export function createApp(): Adversary {
   const app = new Adversary({
-    name: "complexity",
-    version: "0.0.1",
+    name: "meta/complexity",
+    version: "0.0.4",
     review: { maximumFindings: 6, minimumConfidence: "medium" },
   });
 
