@@ -42,6 +42,6 @@ test("the published runtime executes without the development dependency tree", a
 
   const envelope = JSON.parse(await readFile(output, "utf8"));
   assert.equal(envelope.protocolVersion, 1);
-  assert.equal(envelope.result.adversary.name, "meta/complexity");
+  assert.equal(envelope.result.adversary.name, "review/complexity");
   assert.deepEqual(envelope.result.findings, []);
 });

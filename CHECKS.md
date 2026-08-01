@@ -1,6 +1,6 @@
 # Checks — what complexity detects
 
-This file is the **public audit list** of detectors for the **complexity** adversary. It reviews *revisions* (diffs), not codebases: every finding is anchored to a change, compared against the pre-change baseline. Complexity review is the easiest place to become a nag machine, so the calibration principles below are product surface, not implementation detail.
+This file is the **public audit list** of detectors for the **review/complexity** adversary. It reviews *revisions* (diffs), not codebases: every finding is anchored to a change, compared against the pre-change baseline. Complexity review is the easiest place to become a nag machine, so the calibration principles below are product surface, not implementation detail.
 
 Runtime source of truth: [`src/spec.ts`](src/spec.ts) / [`src/rules.ts`](src/rules.ts).
 
