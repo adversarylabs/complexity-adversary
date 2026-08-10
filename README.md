@@ -41,6 +41,7 @@ Diff-aware findings always point to current changed code. Added functions requir
 | `complexity.parameter-growth` | Expanding parameter lists |
 | `complexity.abstraction.premature` | New interfaces, factories, or generics with little demonstrated variation |
 | `complexity.indirection` | Long forwarding-only call chains |
+| `complexity.wrapper.trivial` | New one-use JSX layout wrappers with no behavior or semantics |
 | `complexity.ai-overengineering` | Synthesized architecture, indirection, and complexity signals |
 | `complexity.branch-without-tests` | Material decision growth without changed tests |
 | `complexity.responsibility-expansion` | Parsing, validation, orchestration, persistence, and formatting accumulating together |
