@@ -8,6 +8,7 @@ interface Candidate {
 
 interface DesignSignals {
   premature: Array<{ path: string; line: number; kind: string; name: string; detail: string }>;
+  trivialWrappers: Array<{ path: string; line: number; endLine: number; name: string; target?: string }>;
   wrapperGrowth: number;
   chain?: { path: string; names: string[]; line: number };
   complexityPressure: number;
@@ -81,6 +82,7 @@ export function reviewComplexity(ctx: RuleContext, analysis: Analysis): void {
     emitPrematureAbstraction(ctx, design);
     emitIndirection(ctx, design);
   }
+  emitTrivialWrappers(ctx, design);
 
   if (branchWithoutTests) {
     const evidence = analysis.deltas
@@ -161,8 +163,33 @@ export function reviewComplexity(ctx: RuleContext, analysis: Analysis): void {
 
   addPositiveSignals(ctx, analysis);
   addOverallReview(ctx, analysis, {
-    materialFindings: cyclomatic.length + cognitive.length + nesting.length + growth.length + responsibilities.length + (aiOverengineering ? 2 : 0),
+    materialFindings: cyclomatic.length + cognitive.length + nesting.length + growth.length + responsibilities.length + (design.trivialWrappers.length > 0 ? 1 : 0) + (aiOverengineering ? 2 : 0),
     aiOverengineering,
+  });
+}
+
+function emitTrivialWrappers(ctx: RuleContext, design: DesignSignals): void {
+  if (design.trivialWrappers.length === 0) return;
+  const wrappers = design.trivialWrappers.slice(0, 5);
+  ctx.finding({
+    ruleId: "complexity.wrapper.trivial",
+    title: "One-use layout wrappers add indirection without behavior",
+    category: "design",
+    severity: "low",
+    confidence: "medium",
+    summary: wrappers.length === 1
+      ? `${wrappers[0]?.name} only delegates to one JSX element and has one visible call site.`
+      : `${wrappers.length} new one-use components only delegate to a JSX element; the related indirection is grouped here.`,
+    whyItMatters: "A name earns its navigation cost when it expresses a domain concept, owns behavior, or supports real reuse. A one-use layout delegate still requires readers to inspect both the wrapper and its call site.",
+    impact: "The component surface grows without hiding meaningful behavior, making the layout harder to read and future changes more scattered.",
+    evidence: wrappers.map((wrapper) => ({
+      location: { file: wrapper.path, line: wrapper.line, endLine: wrapper.endLine },
+      label: wrapper.name,
+      message: `${wrapper.name} directly returns ${wrapper.target ?? "one JSX element"} and has one visible use in this file.`,
+      data: { component: wrapper.name, target: wrapper.target, visibleUses: 1 },
+    })),
+    recommendation: "Inline the returned element at its only call site, unless this component is intended to own behavior, semantics, or demonstrated reuse that is not visible in the change.",
+    remediation: { complexity: "small" },
   });
 }
 
@@ -286,6 +313,7 @@ function emitOverengineering(
 function designSignals(analysis: Analysis, complexityPressure: number): DesignSignals {
   const previousByPath = new Map(analysis.previous.map((file) => [file.path, file]));
   const premature: DesignSignals["premature"] = [];
+  const trivialWrappers: DesignSignals["trivialWrappers"] = [];
   let wrapperGrowth = 0;
   let bestChain: DesignSignals["chain"];
 
@@ -295,7 +323,7 @@ function designSignals(analysis: Analysis, complexityPressure: number): DesignSi
     const oldInterfaces = new Set(old?.abstractions.interfaces.map((item) => item.name) ?? []);
     const oldFactories = new Set(old?.abstractions.factories.map((item) => item.name) ?? []);
     const oldGenerics = new Set(old?.abstractions.genericDeclarations.map((item) => item.name) ?? []);
-    const changed = (line: number) => revision?.status !== "modified" || revision.changedLines.has(line);
+    const changed = (line: number, endLine = line) => revision?.status !== "modified" || intersects(revision.changedLines, line, endLine);
 
     for (const item of file.abstractions.interfaces) {
       if (!oldInterfaces.has(item.name) && changed(item.line) && item.implementations <= 1) {
@@ -313,6 +341,16 @@ function designSignals(analysis: Analysis, complexityPressure: number): DesignSi
       }
     }
 
+    if (analysis.mode === "diff") {
+      const oldWrappersByName = new Map(old?.abstractions.wrappers.map((item) => [item.name, item]) ?? []);
+      for (const item of file.abstractions.wrappers) {
+        if (item.kind !== "jsx" || !/^[A-Z]/.test(item.name) || item.references !== 1 || !changed(item.line, item.endLine)) continue;
+        const previous = oldWrappersByName.get(item.name);
+        if (previous?.kind === "jsx" && previous.references === 1) continue;
+        trivialWrappers.push({ path: file.path, line: item.line, endLine: item.endLine, name: item.name, target: item.target });
+      }
+    }
+
     const oldWrappers = old?.abstractions.wrappers.length ?? 0;
     wrapperGrowth += Math.max(0, file.abstractions.wrappers.length - oldWrappers);
     const chain = longestWrapperChain(file);
@@ -321,7 +359,12 @@ function designSignals(analysis: Analysis, complexityPressure: number): DesignSi
     }
   }
 
-  return { premature, wrapperGrowth, chain: bestChain, complexityPressure };
+  return { premature, trivialWrappers, wrapperGrowth, chain: bestChain, complexityPressure };
+}
+
+function intersects(lines: Set<number>, start: number, end: number): boolean {
+  for (const line of lines) if (line >= start && line <= end) return true;
+  return false;
 }
 
 function longestWrapperChain(file: FileMetrics): DesignSignals["chain"] {
@@ -487,7 +530,7 @@ function increased(
 }
 
 type NumericMetric = {
-  [K in keyof FunctionMetrics]: FunctionMetrics[K] extends number ? K : never;
+  [K in keyof FunctionMetrics]-?: FunctionMetrics[K] extends number ? K : never;
 }[keyof FunctionMetrics];
 
 function metricSentence(delta: FunctionDelta, key: NumericMetric, label: string): string {

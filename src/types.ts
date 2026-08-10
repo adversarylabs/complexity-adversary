@@ -36,6 +36,9 @@ export interface FunctionMetrics {
   recursiveCalls: number;
   calls: string[];
   wrapper: boolean;
+  wrapperKind?: "call" | "jsx";
+  wrapperTarget?: string;
+  references: number;
   genericParameters: number;
 }
 
@@ -43,7 +46,14 @@ export interface AbstractionMetrics {
   interfaces: Array<{ name: string; line: number; implementations: number }>;
   factories: Array<{ name: string; line: number; constructedTypes: string[] }>;
   genericDeclarations: Array<{ name: string; line: number; parameters: number; references: number }>;
-  wrappers: Array<{ name: string; line: number; target?: string }>;
+  wrappers: Array<{
+    name: string;
+    line: number;
+    endLine: number;
+    target?: string;
+    kind: "call" | "jsx";
+    references: number;
+  }>;
 }
 
 export interface FileMetrics {

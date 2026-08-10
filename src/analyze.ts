@@ -123,7 +123,7 @@ export function analyzeFile(path: string, source: string): FileMetrics {
   const functions = records.map((record) => {
     const ordinal = (nameCounts.get(record.name) ?? 0) + 1;
     nameCounts.set(record.name, ordinal);
-    return structuralMetrics(record, analyzerMetrics, moduleMutable, ordinal);
+    return structuralMetrics(record, ast, analyzerMetrics, moduleMutable, ordinal);
   });
 
   return {
@@ -178,6 +178,7 @@ function establishedMetrics(path: string, source: string): Array<{
 
 function structuralMetrics(
   record: FunctionRecord,
+  ast: AstNode,
   established: ReturnType<typeof establishedMetrics>,
   moduleMutable: Set<string>,
   ordinal: number,
@@ -233,6 +234,8 @@ function structuralMetrics(
   const cyclomatic = closestMetric(rangeMetrics, "cyclomatic", record.line) ?? 1;
   const cognitive = closestMetric(rangeMetrics, "cognitive", record.line) ?? 0;
   const genericParameters = typeParameterCount(record.node);
+  const jsxTarget = directJsxDelegation(record.node);
+  const callWrapper = callCount === 1 && branches === 0 && statementCount <= 2;
 
   return {
     key: `${record.name}#${ordinal}`,
@@ -252,7 +255,10 @@ function structuralMetrics(
     configSurface: configProperties.size,
     recursiveCalls,
     calls: [...new Set(calls)].sort(),
-    wrapper: callCount === 1 && branches === 0 && statementCount <= 2,
+    wrapper: callWrapper || jsxTarget !== undefined,
+    wrapperKind: jsxTarget !== undefined ? "jsx" : callWrapper ? "call" : undefined,
+    wrapperTarget: jsxTarget ?? (callWrapper ? calls[0] : undefined),
+    references: Math.max(0, countSymbol(ast, record.name) - 1),
     genericParameters,
   };
 }
@@ -340,8 +346,84 @@ function abstractionMetrics(ast: AstNode, functions: FunctionMetrics[]): Abstrac
     genericDeclarations: dedupeBy(genericDeclarations, (item) => `${item.name}:${item.line}`),
     wrappers: functions
       .filter((fn) => fn.wrapper)
-      .map((fn) => ({ name: fn.name, line: fn.line, target: fn.calls[0] })),
+      .map((fn) => ({
+        name: fn.name,
+        line: fn.line,
+        endLine: fn.endLine,
+        target: fn.wrapperTarget,
+        kind: fn.wrapperKind ?? "call",
+        references: fn.references,
+      })),
   };
+}
+
+function directJsxDelegation(node: AstNode): string | undefined {
+  const body = isNode(node.body) ? node.body : undefined;
+  if (body === undefined) return undefined;
+
+  let returned: AstNode | undefined;
+  if (body.type === "JSXElement") {
+    returned = body;
+  } else if (body.type === "BlockStatement") {
+    const statements = arrayNodes(body.body);
+    if (statements.length !== 1 || statements[0]?.type !== "ReturnStatement") return undefined;
+    returned = isNode(statements[0].argument) ? statements[0].argument : undefined;
+  }
+  if (returned?.type !== "JSXElement") return undefined;
+
+  const opening = isNode(returned.openingElement) ? returned.openingElement : undefined;
+  if (opening === undefined || hasMeaningfulJsxAttributes(opening)) return undefined;
+  if (hasMeaningfulJsxChildren(returned)) return undefined;
+  return jsxElementName(opening.name);
+}
+
+function hasMeaningfulJsxAttributes(opening: AstNode): boolean {
+  for (const attribute of arrayNodes(opening.attributes)) {
+    if (attribute.type === "JSXSpreadAttribute") return true;
+    if (attribute.type !== "JSXAttribute") return true;
+    const name = jsxElementName(attribute.name);
+    if (name === undefined) return true;
+    if (/^on[A-Z]/.test(name) || /^(?:role|tabIndex|alt|href|htmlFor)$/i.test(name) || /^aria-/i.test(name)) {
+      return true;
+    }
+    if (attribute.value === null || attribute.value === undefined) return true;
+    const value = isNode(attribute.value) ? attribute.value : undefined;
+    if (value?.type === "Literal") continue;
+    if (value?.type !== "JSXExpressionContainer") return true;
+    const expression = isNode(value.expression) ? value.expression : undefined;
+    if (expression?.type !== "Literal") return true;
+  }
+  return false;
+}
+
+function hasMeaningfulJsxChildren(element: AstNode): boolean {
+  for (const child of arrayNodes(element.children)) {
+    if (child.type === "JSXText") {
+      if (typeof child.value === "string" && child.value.trim() !== "") return true;
+      continue;
+    }
+    if (child.type !== "JSXExpressionContainer") return true;
+    const expression = isNode(child.expression) ? child.expression : undefined;
+    if (expression?.type === "JSXEmptyExpression") continue;
+    if (identifierName(expression) !== "children") return true;
+  }
+  return false;
+}
+
+function jsxElementName(value: unknown): string | undefined {
+  if (!isNode(value)) return undefined;
+  if (value.type === "JSXIdentifier") return typeof value.name === "string" ? value.name : undefined;
+  if (value.type === "JSXMemberExpression") {
+    const object = jsxElementName(value.object);
+    const property = jsxElementName(value.property);
+    return object !== undefined && property !== undefined ? `${object}.${property}` : undefined;
+  }
+  if (value.type === "JSXNamespacedName") {
+    const namespace = jsxElementName(value.namespace);
+    const name = jsxElementName(value.name);
+    return namespace !== undefined && name !== undefined ? `${namespace}:${name}` : undefined;
+  }
+  return identifierName(value);
 }
 
 function walkFunction(
@@ -471,6 +553,17 @@ function countIdentifier(ast: AstNode, name: string): number {
   let count = 0;
   walk(ast, (node) => {
     if (node.type === "Identifier" && identifierName(node) === name) count += 1;
+  });
+  return count;
+}
+
+function countSymbol(ast: AstNode, name: string): number {
+  let count = 0;
+  walk(ast, (node, parent) => {
+    if (node.type === "Identifier" && identifierName(node) === name) count += 1;
+    if (node.type === "JSXIdentifier" && parent?.type === "JSXOpeningElement" && parent.name === node && jsxElementName(node) === name) {
+      count += 1;
+    }
   });
   return count;
 }

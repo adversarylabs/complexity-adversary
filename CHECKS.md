@@ -44,6 +44,7 @@ Premature abstraction, indirection, responsibility expansion, and AI overenginee
 | --- | --- |
 | `complexity.abstraction.premature` | Does this new interface/factory/layer have a second concrete user, or a named forthcoming one? |
 | `complexity.indirection` | Does each added hop (wrapper, delegate, pass-through) own a decision, or just forward one? |
+| `complexity.wrapper.trivial` | Does this new one-use JSX component own behavior, semantics, or reuse that justifies navigating through it? |
 | `complexity.responsibility-expansion` | Did an existing unit absorb a new concern that belongs elsewhere? |
 | `complexity.ai-overengineering` | Does the change carry hallmark generated-code excess (defensive rethrows, redundant guards, speculative options) without a driving requirement? |
 

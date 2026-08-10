@@ -14,6 +14,7 @@ Review whether implementation complexity is disproportionate to the behavior add
 
 - Over-abstraction for simple behavior
 - Unnecessary indirection / layering
+- One-use JSX layout wrappers that add no behavior, semantics, or demonstrated reuse
 - Complexity that harms maintainability without benefit
 
 ## Out of scope (not a miss for this adversary)

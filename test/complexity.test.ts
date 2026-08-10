@@ -10,16 +10,16 @@ import { createApp } from "../src/index.ts";
 
 const execute = promisify(execFile);
 
-async function repository(before: string, after: string, testChange?: string): Promise<string> {
+async function repository(before: string, after: string, testChange?: string, sourceFile = "service.ts"): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "complexity-repo-"));
   await mkdir(join(root, "src"), { recursive: true });
-  await writeFile(join(root, "src", "service.ts"), before);
+  await writeFile(join(root, "src", sourceFile), before);
   await execute("git", ["init", "-q"], { cwd: root });
   await execute("git", ["config", "user.email", "complexity@example.test"], { cwd: root });
   await execute("git", ["config", "user.name", "Complexity Tests"], { cwd: root });
   await execute("git", ["add", "."], { cwd: root });
   await execute("git", ["commit", "-qm", "baseline"], { cwd: root });
-  await writeFile(join(root, "src", "service.ts"), after);
+  await writeFile(join(root, "src", sourceFile), after);
   if (testChange !== undefined) {
     await mkdir(join(root, "test"), { recursive: true });
     await writeFile(join(root, "test", "service.test.ts"), testChange);
@@ -154,6 +154,64 @@ export function controller(value: number) { return manager(value); }
   assert.match(JSON.stringify(finding.evidence), /controller|manager|resolver|strategy/);
 });
 
+test("flags exported one-use JSX layout wrappers", async () => {
+  const before = `type Props = { children: React.ReactNode };
+export function AvatarEditor() { return <Flex margin="md"><Cropper /></Flex>; }
+`;
+  const after = `type Props = { children: React.ReactNode };
+export function CropperContainer({children}: Props) {
+  return <Flex margin="md">{children}</Flex>;
+}
+export function AvatarEditor() {
+  return <CropperContainer><Cropper /></CropperContainer>;
+}
+`;
+  const output = await review(await repository(before, after, undefined, "service.tsx"));
+  const finding = output.findings.find((item) => item.ruleId === "complexity.wrapper.trivial");
+  assert.ok(finding);
+  assert.match(JSON.stringify(finding.evidence), /CropperContainer|Flex/);
+});
+
+test("groups multiple trivial JSX wrappers into one finding", async () => {
+  const after = `type Props = { children: React.ReactNode };
+function FirstLayout({children}: Props) { return <Flex margin="md">{children}</Flex>; }
+function SecondLayout({children}: Props) { return <Stack gap="sm">{children}</Stack>; }
+export function Screen() {
+  return <><FirstLayout><One /></FirstLayout><SecondLayout><Two /></SecondLayout></>;
+}
+`;
+  const output = await review(await repository("export function Screen() { return <><One /><Two /></>; }\n", after, undefined, "service.tsx"));
+  const findings = output.findings.filter((item) => item.ruleId === "complexity.wrapper.trivial");
+  assert.equal(findings.length, 1);
+  assert.match(JSON.stringify(findings[0]?.evidence), /FirstLayout/);
+  assert.match(JSON.stringify(findings[0]?.evidence), /SecondLayout/);
+});
+
+test("keeps reused and behavior-owning JSX wrappers quiet", async () => {
+  const reused = `type Props = { children: React.ReactNode };
+function SharedLayout({children}: Props) { return <Flex margin="md">{children}</Flex>; }
+export function First() { return <SharedLayout><One /></SharedLayout>; }
+export function Second() { return <SharedLayout><Two /></SharedLayout>; }
+`;
+  const behavioral = `type Props = { children: React.ReactNode };
+function AccessibleCropper({children}: Props) {
+  return <Flex role="group" onKeyDown={handleCropperKeys}>{children}</Flex>;
+}
+export function AvatarEditor() { return <AccessibleCropper><Cropper /></AccessibleCropper>; }
+`;
+  const transformed = `type Props = { children: React.ReactNode, margin: number };
+function ComputedLayout({children, margin}: Props) {
+  return <Flex {...layoutProps} margin={margin + 1}>{children}</Flex>;
+}
+export function AvatarEditor() { return <ComputedLayout margin={2}><Cropper /></ComputedLayout>; }
+`;
+  const baseline = "export function AvatarEditor() { return <Cropper />; }\n";
+  for (const source of [reused, behavioral, transformed]) {
+    const output = await review(await repository(baseline, source, undefined, "service.tsx"));
+    assert.equal(output.findings.some((item) => item.ruleId === "complexity.wrapper.trivial"), false);
+  }
+});
+
 test("synthesizes multiple architecture smells into the flagship rule", async () => {
   const overbuilt = `interface Runner { run(value: number): number }
 class DefaultRunner implements Runner { run(value: number) { return value + 1; } }
@@ -242,6 +300,17 @@ test("repository-only scans are conservative", async () => {
   assert.deepEqual(output.findings, []);
   assert.equal(output.assessment?.risk, "none");
   assert.match(output.observations[0]?.summary ?? "", /without a git baseline/i);
+});
+
+test("repository-only scans do not infer that JSX wrappers are newly introduced", async () => {
+  const root = await mkdtemp(join(tmpdir(), "complexity-snapshot-"));
+  await mkdir(join(root, "src"), { recursive: true });
+  await writeFile(join(root, "src", "service.tsx"), `type Props = { children: React.ReactNode };
+function Layout({children}: Props) { return <Flex margin="md">{children}</Flex>; }
+export function Screen() { return <Layout><Content /></Layout>; }
+`);
+  const output = await review(root);
+  assert.equal(output.findings.some((finding) => finding.ruleId === "complexity.wrapper.trivial"), false);
 });
 
 test("output is deterministic", async () => {
