@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
-import { readFile, readdir } from "node:fs/promises";
-import { extname, join, relative, sep } from "node:path";
+import { extname } from "node:path";
 import { promisify } from "node:util";
+import { type RuleContext } from "@adversarylabs/sdk";
 import { SOURCE_EXTENSIONS, type SourceRevision } from "./types.js";
 
 const execute = promisify(execFile);
@@ -18,7 +18,6 @@ const IGNORED_DIRECTORIES = new Set([
   "node_modules",
   "vendor",
 ]);
-const MAX_FILE_BYTES = 750_000;
 const MAX_FILES = 500;
 
 export interface Discovery {
@@ -29,87 +28,53 @@ export interface Discovery {
   changedSourceFiles: number;
 }
 
-export async function discoverSources(repoPath: string): Promise<Discovery> {
-  const git = await isGitRepository(repoPath);
-  if (!git) {
-    const files = await repositoryFiles(repoPath);
+export async function discoverSources(ctx: RuleContext): Promise<Discovery> {
+  const repoPath = ctx.repoPath;
+  const sources = await ctx.loadInScopeSources({ include: isSourcePath, limit: MAX_FILES });
+  if (ctx.change === null || ctx.change.scanMode === "all") {
     return {
       mode: "repository",
-      files: await readRepositorySources(repoPath, files),
+      files: sources.map((source) => ({
+        path: source.path,
+        current: source.content,
+        changedLines: new Set<number>(),
+        status: "repository",
+      })),
       changedTestFiles: 0,
-      changedSourceFiles: files.length,
+      changedSourceFiles: sources.length,
     };
   }
 
-  const worktree = await gitOutput(repoPath, ["diff", "--name-status", "--find-renames", "HEAD", "--"]);
-  if (worktree.trim() !== "") {
-    return diffDiscovery(repoPath, "HEAD", worktree);
-  }
-
-  const base = await chooseBase(repoPath);
-  if (base !== undefined) {
-    const names = await gitOutput(repoPath, ["diff", "--name-status", "--find-renames", base, "HEAD", "--"]);
-    if (names.trim() !== "") {
-      return diffDiscovery(repoPath, base, names);
-    }
-  }
-
-  const files = (await gitOutput(repoPath, ["ls-files", "-z"]))
-    .split("\0")
-    .filter((path) => isSourcePath(path))
-    .slice(0, MAX_FILES);
-  return {
-    mode: "repository",
-    files: await readRepositorySources(repoPath, files),
-    changedTestFiles: 0,
-    changedSourceFiles: files.length,
-  };
-}
-
-async function diffDiscovery(repoPath: string, base: string, names: string): Promise<Discovery> {
-  const records = parseNameStatus(names).filter((record) => record.status !== "D");
-  const sourceRecords = records.filter((record) => isSourcePath(record.path)).slice(0, MAX_FILES);
   const files: SourceRevision[] = [];
-
-  for (const record of sourceRecords) {
-    const absolute = join(repoPath, record.path);
-    const current = await safeRead(absolute);
-    if (current === undefined) continue;
-    const oldPath = record.oldPath ?? record.path;
-    const previous = record.status === "A" ? undefined : await gitShow(repoPath, base, oldPath);
-    const changedLines = await changedLineNumbers(repoPath, base, record.path);
+  for (const source of sources) {
+    const base = ctx.change.baseRef;
+    const exists = base !== undefined && await existsAtRevision(repoPath, base, source.path);
     files.push({
-      path: record.path,
-      current,
-      previous,
-      changedLines,
-      status: record.status === "A" ? "added" : "modified",
+      path: source.path,
+      current: source.content,
+      previous: exists && base !== undefined ? await gitShow(repoPath, base, source.path) : undefined,
+      changedLines: exists ? await changedLineNumbers(ctx, source.path) : new Set<number>(),
+      status: exists ? "modified" : "added",
     });
   }
 
   return {
     mode: "diff",
-    base,
+    ...(ctx.change.baseRef === undefined ? {} : { base: ctx.change.baseRef }),
     files,
-    changedTestFiles: records.filter((record) => isTestPath(record.path)).length,
-    changedSourceFiles: sourceRecords.filter((record) => !isTestPath(record.path)).length,
+    changedTestFiles: ctx.change.changedFiles.filter((path) => isSourcePath(path) && isTestPath(path)).length,
+    changedSourceFiles: files.filter((file) => !isTestPath(file.path)).length,
   };
 }
 
-async function chooseBase(repoPath: string): Promise<string | undefined> {
-  for (const candidate of ["origin/main", "origin/master", "main", "master"]) {
-    if (!(await revisionExists(repoPath, candidate))) continue;
-    const mergeBase = (await gitOutput(repoPath, ["merge-base", "HEAD", candidate])).trim();
-    if (mergeBase !== "" && mergeBase !== (await gitOutput(repoPath, ["rev-parse", "HEAD"])).trim()) {
-      return mergeBase;
-    }
-  }
-  if (await revisionExists(repoPath, "HEAD^")) return "HEAD^";
-  return undefined;
-}
-
-async function changedLineNumbers(repoPath: string, base: string, path: string): Promise<Set<number>> {
-  const patch = await gitOutput(repoPath, ["diff", "--unified=0", base, "--", path]);
+async function changedLineNumbers(ctx: RuleContext, path: string): Promise<Set<number>> {
+  const base = ctx.change?.baseRef;
+  if (base === undefined) return new Set<number>();
+  const args = ["diff", "--unified=0", base];
+  const head = ctx.change?.headRef;
+  if (head !== undefined && !ctx.change?.worktree) args.push(head);
+  args.push("--", path);
+  const patch = await gitOutput(ctx.repoPath, args);
   const lines = new Set<number>();
   for (const match of patch.matchAll(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm)) {
     const start = Number(match[1]);
@@ -117,49 +82,6 @@ async function changedLineNumbers(repoPath: string, base: string, path: string):
     for (let line = start; line < start + count; line += 1) lines.add(line);
   }
   return lines;
-}
-
-async function repositoryFiles(repoPath: string): Promise<string[]> {
-  const result: string[] = [];
-  async function walk(directory: string): Promise<void> {
-    if (result.length >= MAX_FILES) return;
-    const entries = await readdir(directory, { withFileTypes: true });
-    entries.sort((left, right) => left.name.localeCompare(right.name));
-    for (const entry of entries) {
-      if (result.length >= MAX_FILES) return;
-      if (entry.isSymbolicLink()) continue;
-      const absolute = join(directory, entry.name);
-      if (entry.isDirectory()) {
-        if (!IGNORED_DIRECTORIES.has(entry.name)) await walk(absolute);
-      } else {
-        const path = relative(repoPath, absolute).split(sep).join("/");
-        if (isSourcePath(path)) result.push(path);
-      }
-    }
-  }
-  await walk(repoPath);
-  return result;
-}
-
-async function readRepositorySources(repoPath: string, paths: string[]): Promise<SourceRevision[]> {
-  const files: SourceRevision[] = [];
-  for (const path of paths) {
-    const current = await safeRead(join(repoPath, path));
-    if (current !== undefined) {
-      files.push({ path, current, changedLines: new Set<number>(), status: "repository" });
-    }
-  }
-  return files;
-}
-
-async function safeRead(path: string): Promise<string | undefined> {
-  try {
-    const content = await readFile(path);
-    if (content.byteLength > MAX_FILE_BYTES || content.includes(0)) return undefined;
-    return content.toString("utf8");
-  } catch {
-    return undefined;
-  }
 }
 
 async function gitShow(repoPath: string, revision: string, path: string): Promise<string | undefined> {
@@ -170,20 +92,12 @@ async function gitShow(repoPath: string, revision: string, path: string): Promis
   }
 }
 
-async function revisionExists(repoPath: string, revision: string): Promise<boolean> {
+async function existsAtRevision(repoPath: string, revision: string, path: string): Promise<boolean> {
   try {
-    await execute("git", ["-C", repoPath, "rev-parse", "--verify", "--quiet", revision], {
+    await execute("git", ["-C", repoPath, "cat-file", "-e", `${revision}:${path}`], {
       maxBuffer: 1024 * 1024,
     });
     return true;
-  } catch {
-    return false;
-  }
-}
-
-async function isGitRepository(repoPath: string): Promise<boolean> {
-  try {
-    return (await gitOutput(repoPath, ["rev-parse", "--is-inside-work-tree"])).trim() === "true";
   } catch {
     return false;
   }
@@ -195,20 +109,6 @@ async function gitOutput(repoPath: string, args: string[]): Promise<string> {
     maxBuffer: 16 * 1024 * 1024,
   });
   return stdout;
-}
-
-function parseNameStatus(output: string): Array<{ status: string; path: string; oldPath?: string }> {
-  return output
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => {
-      const fields = line.split("\t");
-      const status = fields[0]?.slice(0, 1) ?? "";
-      if ((status === "R" || status === "C") && fields.length >= 3) {
-        return { status, oldPath: fields[1], path: fields[2] ?? "" };
-      }
-      return { status, path: fields[1] ?? "" };
-    });
 }
 
 function isSourcePath(path: string): boolean {

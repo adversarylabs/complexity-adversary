@@ -28,7 +28,33 @@ async function repository(before: string, after: string, testChange?: string, so
 }
 
 async function review(root: string) {
-  return createApp().run({ input: { source: { path: root } }, includeRawObservations: true });
+  try {
+    await execute("git", ["rev-parse", "--is-inside-work-tree"], { cwd: root });
+    const [{ stdout: tracked }, { stdout: untracked }] = await Promise.all([
+      execute("git", ["diff", "--name-only", "HEAD", "--"], { cwd: root }),
+      execute("git", ["ls-files", "--others", "--exclude-standard"], { cwd: root }),
+    ]);
+    const changedFiles = [...new Set(`${tracked}\n${untracked}`.split(/\r?\n/).filter(Boolean))];
+    return reviewChanged(root, changedFiles);
+  } catch {
+    return createApp().run({ input: { source: { path: root } }, includeRawObservations: true });
+  }
+}
+
+async function reviewChanged(root: string, changedFiles: string[]) {
+  return createApp().run({
+    input: {
+      source: { path: root },
+      change: {
+        type: "diff",
+        base_ref: "HEAD",
+        head_ref: "WORKTREE",
+        scan_mode: "changed",
+        changed_files: changedFiles,
+      },
+    },
+    includeRawObservations: true,
+  });
 }
 
 const SIMPLE = `export function reconcile(input: { ready: boolean; value: number }) {
@@ -97,6 +123,16 @@ test("reports meaningful complexity deltas with concrete before and after metric
   assert.equal(evidence?.data?.function, "reconcile");
   assert.deepEqual((evidence?.data?.previous as Record<string, unknown>)?.cyclomatic, 2);
   assert.ok(Number((evidence?.data?.current as Record<string, unknown>)?.cyclomatic) >= 12);
+});
+
+test("uses the runner-supplied changed files instead of re-deriving repository scope", async () => {
+  const root = await repository(SIMPLE, COMPLEX);
+  await writeFile(join(root, "src", "other.ts"), "export const answer = 42;\n");
+
+  const output = await reviewChanged(root, ["src/other.ts"]);
+  assert.equal(output.target.filesScanned, 1);
+  assert.equal(output.findings.some((finding) =>
+    finding.evidence.some((evidence) => evidence.location?.file === "src/service.ts")), false);
 });
 
 test("ignores small low-baseline increases", async () => {

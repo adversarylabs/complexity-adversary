@@ -15,14 +15,14 @@ export function createApp(): Adversary {
   });
 
   app.rule("complexity.review", async (ctx) => {
-    const discovery = await discoverSources(ctx.repoPath);
+    const discovery = await discoverSources(ctx);
     const analysis = analyzeDiscovery(discovery);
     ctx.summary.files_scanned = discovery.files.length;
     ctx.review.observe({
       key: "complexity.analysis-mode",
       summary:
         analysis.mode === "diff"
-          ? `Compared ${analysis.files.length} changed source files with ${analysis.base}.`
+          ? `Compared ${analysis.files.length} changed source files against ${analysis.base ?? "the supplied baseline"}.`
           : `Reviewed ${analysis.files.length} source files conservatively without a git baseline.`,
       metadata: { mode: analysis.mode, base: analysis.base, supportedLanguages: ["JavaScript", "TypeScript"] },
     });
