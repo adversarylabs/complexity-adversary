@@ -19,4 +19,5 @@
 | `complexity.recursion-risk` | Review | Multiple or expanding recursive paths |
 | `complexity.reduced` | Review | Material reduction in both cyclomatic and cognitive complexity |
 | `complexity.responsibility-expansion` | Review | Parsing, validation, orchestration, persistence, and formatting accumulating together |
+| `complexity.structural-clone.new` | Review | A changed Python, Rust, JavaScript, or TypeScript block growing one established same-file multi-step call sequence into two copies |
 | `complexity.wrapper.trivial` | Review | New one-use JSX layout wrappers with no behavior or semantics |

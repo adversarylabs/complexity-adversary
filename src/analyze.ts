@@ -9,6 +9,7 @@ import {
   type FunctionMetrics,
 } from "./types.js";
 import { type Discovery } from "./discover.js";
+import { findNewStructuralClones } from "./structural-clones.js";
 
 interface Position {
   line: number;
@@ -90,6 +91,7 @@ export function analyzeDiscovery(discovery: Discovery): Analysis {
     deltas,
     aggregateBranchDelta: sumDelta(deltas, "branches"),
     aggregateLocDelta: sumDelta(deltas, "loc"),
+    structuralClones: findNewStructuralClones(discovery.files),
   };
 }
 

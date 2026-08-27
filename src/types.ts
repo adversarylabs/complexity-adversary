@@ -7,7 +7,16 @@ export const SOURCE_EXTENSIONS = new Set([
   ".tsx",
   ".mts",
   ".cts",
+  ".py",
+  ".rs",
 ]);
+
+export interface StructuralClone {
+  path: string;
+  changed: { line: number; endLine: number };
+  existing: { line: number; endLine: number };
+  calls: string[];
+}
 
 export interface SourceRevision {
   path: string;
@@ -81,4 +90,5 @@ export interface Analysis {
   changedSourceFiles: number;
   aggregateBranchDelta: number;
   aggregateLocDelta: number;
+  structuralClones: StructuralClone[];
 }

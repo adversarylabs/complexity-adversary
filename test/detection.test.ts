@@ -15,8 +15,9 @@ test("declares deterministic automatic detection", async () => {
     "**/*.ts",
     "**/*.tsx",
     "**/*.mts",
-    "**/*.cts"
+    "**/*.cts",
+    "**/*.py",
+    "**/*.rs"
   ]);
   assert.equal(manifest.detection?.entrypoint, undefined);
 });
-
