@@ -10,7 +10,7 @@ import { reviewComplexity } from "./rules.js";
 export function createApp(): Adversary {
   const app = new Adversary({
     name: "review/complexity",
-    version: "0.0.9",
+    version: "0.0.12",
     review: { maximumFindings: 6, minimumConfidence: "medium" },
   });
 
@@ -24,7 +24,12 @@ export function createApp(): Adversary {
         analysis.mode === "diff"
           ? `Compared ${analysis.files.length} changed source files against ${analysis.base ?? "the supplied baseline"}.`
           : `Reviewed ${analysis.files.length} source files conservatively without a git baseline.`,
-      metadata: { mode: analysis.mode, base: analysis.base, supportedLanguages: ["JavaScript", "TypeScript"] },
+      metadata: {
+        mode: analysis.mode,
+        base: analysis.base,
+        metricLanguages: ["JavaScript", "TypeScript"],
+        structuralCloneLanguages: ["JavaScript", "TypeScript", "Python", "Rust"],
+      },
     });
     reviewComplexity(ctx, analysis);
   });

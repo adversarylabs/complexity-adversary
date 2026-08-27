@@ -33,6 +33,7 @@ export function reviewComplexity(ctx: RuleContext, analysis: Analysis): void {
     analysis.changedSourceFiles > 0 &&
     analysis.changedTestFiles === 0;
   const aiOverengineering = overengineeringScore(analysis, design, growth, responsibilities) >= 6;
+  const structuralClones = analysis.structuralClones;
 
   emitMetricFinding(ctx, {
     ruleId: "complexity.cyclomatic.increase",
@@ -83,6 +84,7 @@ export function reviewComplexity(ctx: RuleContext, analysis: Analysis): void {
     emitIndirection(ctx, design);
   }
   emitTrivialWrappers(ctx, design);
+  emitStructuralClones(ctx, structuralClones);
 
   if (branchWithoutTests) {
     const evidence = analysis.deltas
@@ -163,8 +165,38 @@ export function reviewComplexity(ctx: RuleContext, analysis: Analysis): void {
 
   addPositiveSignals(ctx, analysis);
   addOverallReview(ctx, analysis, {
-    materialFindings: cyclomatic.length + cognitive.length + nesting.length + growth.length + responsibilities.length + (design.trivialWrappers.length > 0 ? 1 : 0) + (aiOverengineering ? 2 : 0),
+    materialFindings: cyclomatic.length + cognitive.length + nesting.length + growth.length + responsibilities.length + (design.trivialWrappers.length > 0 ? 1 : 0) + structuralClones.length + (aiOverengineering ? 2 : 0),
     aiOverengineering,
+  });
+}
+
+function emitStructuralClones(ctx: RuleContext, clones: Analysis["structuralClones"]): void {
+  if (clones.length === 0) return;
+  const selected = clones.slice(0, 4);
+  ctx.finding({
+    ruleId: "complexity.structural-clone.new",
+    title: "New code repeats an existing multi-step operation",
+    category: "design",
+    severity: "low",
+    confidence: "high",
+    summary: selected.length === 1
+      ? "A changed block copies an established same-file call sequence instead of reusing its implementation."
+      : `${selected.length} changed blocks copy established same-file call sequences.`,
+    whyItMatters: "Two copies of the same multi-step operation can drift in ordering, error handling, or resource lifecycle when either path changes later.",
+    impact: "Maintenance now requires keeping parallel implementations synchronized even though the operation already had a reusable home.",
+    evidence: selected.flatMap((clone) => [{
+      location: { file: clone.path, line: clone.changed.line, endLine: clone.changed.endLine },
+      label: "New copy",
+      message: `This changed span repeats ${clone.calls.length} calls from the existing operation: ${clone.calls.join(" → ")}.`,
+      data: { calls: clone.calls, role: "changed-copy" },
+    }, {
+      location: { file: clone.path, line: clone.existing.line, endLine: clone.existing.endLine },
+      label: "Existing operation",
+      message: "The same normalized call sequence already existed here in the base revision.",
+      data: { calls: clone.calls, role: "existing-operation" },
+    }]),
+    recommendation: "Reuse or parameterize the existing operation when the ordering, side effects, and failure behavior are intended to stay aligned; otherwise make the semantic difference explicit.",
+    remediation: { complexity: "small" },
   });
 }
 
