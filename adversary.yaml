@@ -1,4 +1,4 @@
-name: review/complexity
+name: adversarylabs/review/complexity
 version: 0.0.12
 description: Reviews code changes for implementation complexity that appears disproportionate to the behavior being added.
 
